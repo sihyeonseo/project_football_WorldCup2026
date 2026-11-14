@@ -17,8 +17,7 @@ YOLO 객체 탐지 모델과 컴퓨터 비전 기법을 활용하여 축구 경�
 ├── trackers/                    # YOLO 객체 탐지 및 트래킹 로직
 ├── utils/                       # 바운딩 박스, 비디오 입출력 등 유틸리티 함수
 ├── main.py                      # 전체 파이프라인 실행 메인 스크립트
-├── requirements.txt             # 의존성 패키지 목록
-└── .gitignore                   # Git 업로드 제외 설정
+└── requirements.txt             # 의존성 패키지 목록
 ```
 
 ## 🚀 실행 방법
