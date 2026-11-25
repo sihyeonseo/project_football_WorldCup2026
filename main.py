@@ -33,7 +33,8 @@ def main():
 
     # 5. Assign Player Teams
     team_assigner = TeamAssigner()
-    team_assigner.assign_team_color(video_frames[0], tracks['players'][0])
+    init_frame = max(range(len(tracks['players'])), key=lambda i: len(tracks['players'][i]))
+    team_assigner.assign_team_color(video_frames[init_frame], tracks['players'][init_frame])
 
     for frame_num, player_track in enumerate(tracks['players']):
         for player_id, track in player_track.items():
