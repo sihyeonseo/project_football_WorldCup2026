@@ -1,97 +1,97 @@
 # Football Video Analytics (FIFA World Cup 2026)
 
-단일 축구 중계 영상에서 선수·골키퍼·심판·공을 탐지·추적하고, 비지도 팀 분류, 공 점유율 산출, 카메라 이동량 보정, 그리고 2D 전술 피치 투영(Dynamic Homography)까지 수행하는 End-to-End 스포츠 영상 분석 파이프라인입니다.
+단일 축구 중계 영상에서 선수·골키퍼·심판·공을 탐지·추적하고, 비지도 팀 분류, 공 궤적 복원, 팀 점유율 산출, 카메라 이동량 보정, 그리고 2D 전술 피치 투영(Homography)까지 수행하는 스포츠 영상 분석 파이프라인입니다.
 
-> **핵심 목표**: 단순 YOLO 적용에 그치지 않고, **객체 탐지·추적 오류가 최종 스포츠 분석 지표(팀 점유율)에 미치는 영향을 정량 검증하고 단계적으로 개선**하는 데 초점을 맞추었습니다.
+> **베이스라인 출처**: [abdullahtarek/football_analysis](https://github.com/abdullahtarek/football_analysis)를 기반으로 시작해, **학습 도메인(분데스리가)과 다른 Unseen 경기 영상(FIFA 월드컵 한국 vs 체코 하이라이트)**에서 발생하는 탐지·추적·분류·점유율 오류를 정량 진단하고 단계적으로 개선했습니다.
 
 ---
 
-## 1. Core Pipeline
+## 1. Repository Structure
 
 ```text
-Broadcast Video
-  └─▶ [1] Detection: YOLO26m (1280px, 4 classes: player / goalkeeper / referee / ball)
-        └─▶ [2] Tracking & Ball Restoration: ByteTrack (players/referees) + Ball Outlier Filter (80px) & Linear Interp
-              └─▶ [3] Unsupervised Team Clustering: Upper-body K-Means (border-pixel mode background removal)
-                    └─▶ [4] Possession & Tactical Analytics: Proximity Assignment (70px / 2.5m) + 0.5s Mode Smoothing
-                          └─▶ [Parallel] Optical Flow Camera Movement & 32-Keypoint Dynamic Homography (2D Pitch)
+project_football_WorldCup2026/
+├── main.py                              # End-to-End 실행 엔트리포인트 (CLI 인자, 원본 FPS 유지, 0.5s 스무딩 통합)
+├── project_football_WorldCup2026.ipynb  # Colab 학습 및 전체 실험 로그 (API 키 마스킹 완료)
+├── trackers/tracker.py                  # YOLO26m(1280px) + ByteTrack + 공 이상치 필터 + Linear Interp / Kalman Filter
+├── team_assigner/team_assigner.py       # 상반신 전체 테두리 픽셀 최빈값 배경 제거 + K-Means(K=2) 팀 분류
+├── player_ball_assigner/                # 70px 발 거리 기반 점유 판정 + 0.5s 최빈값 스무딩 (Causal/Bidirectional)
+├── camera_movement_estimator/           # Optical Flow(PyrLK) 중앙값 기반 카메라 이동량 추정 및 좌표 보정
+├── tactical_view/homography.py          # 정적 6점 / Roboflow 32-키포인트 Homography & 70px vs 2.5m 비교 모듈
+├── utils/                               # 영상 입출력(원본 FPS 보존) 및 BBox 기하 연산 유틸리티
+└── experiments/                         # 정량 평가 재현 스크립트
+    ├── eval_detection_2x2.py            # 모델 × 해상도 2×2 통제 실험 (mAP, Ball AP, Model FPS, Peak VRAM)
+    ├── eval_ball_restoration.py         # Raw vs Linear Interp(오프라인) vs Kalman Filter(온라인) 비교
+    └── eval_possession.py               # KOR vs CZE 0~35s 점유율 6조건 Ablation + 동일 분모 검증
 ```
 
 ---
 
-## 2. Controlled Experiments & Quantitative Evaluation
+## 2. Core Pipeline
 
-### ① 모델 × 해상도 2×2 통제 실험 (Unseen Match Test)
-학습 데이터(분데스리가)와 환경이 다른 **FIFA 월드컵 한국 vs 체코 하이라이트 영상에서 55프레임(811개 객체)을 직접 라벨링**해 Out-of-Domain 검증셋을 구축하고, 모델 아키텍처와 입력 해상도의 기여도를 분리 검증했습니다. *(Tesla T4 기준)*
-
-| Model | Input Size | All `mAP@50` | All `mAP@50-95` | `Ball AP@50` | `Player AP@50` | Inference (ms) | FPS | Peak VRAM |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| YOLOv5m | 640 | 0.552 | 0.390 | 0.110 | 0.857 | 12.7 | 78.4 | 0.80 GB |
-| YOLOv5m | 1280 | 0.419 | 0.269 | 0.192 | 0.778 | 45.5 | 22.0 | 2.42 GB |
-| YOLO26m | 640 | 0.657 | 0.456 | 0.263 | **0.892** | 15.7 | 63.8 | 1.06 GB |
-| **YOLO26m (채택)** | **1280** | **0.662** | **0.485** | **0.397 (3.6×)** | 0.881 | 66.2 | 15.1 | 3.39 GB |
-
-* **해상도 단독 상향의 한계**: `YOLOv5m`에서 해상도만 `1280`으로 키우면 큰 객체(`player`) 탐지가 흔들리며 전체 `mAP@50`이 오히려 하락(`0.552 → 0.419`).
-* **아키텍처 + 고해상도 시너지**: `YOLO26m`은 `640px`에서 실시간성(`63.8 FPS`, `1.06 GB`)과 정확도(`0.657`)를 모두 확보했으며, `1280px`에서 소형 객체 **`Ball AP@50`을 `0.110 → 0.397`(3.6×)**으로 극대화.
-* **참고**: `YOLOv5m`은 `640px`, `YOLO26m`은 `1280px` 조건으로 학습된 가중치를 사용했으며, `goalkeeper`는 필드 선수와 외형이 겹쳐 오분류가 잦은 경향을 확인해 추적 단계에서 `player`로 병합 처리.
+```text
+Broadcast Video (OpenCV, 원본 FPS 유지)
+ └─▶ [1] Detection: YOLO26m (1280px, conf=0.1, batch=20)
+      ├─▶ Players + Goalkeeper(merged) & Referees ──▶ ByteTrack (ID 유지)
+      └─▶ Ball (ByteTrack 미적용) ──▶ conf >= 0.2 단일 최고신뢰도 선택
+                                  ──▶ 이상치 필터 (min(80*gap, 300)px) + Linear Interp / Kalman Filter
+ └─▶ [2] Camera Movement: Optical Flow (PyrLK, status==1 중앙값 변위) → 좌표 보정
+ └─▶ [3] Team Clustering: 최다 선수 탐지 프레임 K-Means(K=2) + 전체 테두리 픽셀 최빈값 배경 제거
+ └─▶ [4] Possession Analytics: 발-공 거리(70px) 판정 + 0.5s 최빈값 스무딩
+ └─▶ [5] Tactical View (Optional): 정적 6점 / 32-Keypoint Homography 2D 피치 투영
+```
 
 ---
 
-### ② 공 추적 실패 분석 및 복원 비교 (Raw vs Linear Interp vs Kalman Filter)
-`ByteTrack`은 선수·심판에만 적용되고 공(`ball`)에는 적용되지 않으므로, 공 전용 후처리 기법을 정량 비교했습니다. (`clip_0127_0131.mp4`, 240프레임)
+## 3. Quantitative Evaluation
 
-| Method | Missing Rate (%) | Jumps (>80px/frame) | 8-Frame Occlusion MAE | 8-Frame Occlusion RMSE |
+### ① 모델 × 추론 해상도 비교 (Unseen KOR vs CZE 55장, 811객체, Tesla T4)
+
+학습 데이터([Roboflow `football-players-detection` v1](https://universe.roboflow.com/roboflow-jvuqo/football-players-detection-3zvbc), Train 612 / Valid 38)와 다른 Unseen 경기 영상 55장에서 모델 아키텍처와 추론 해상도 트레이드오프를 측정했습니다. (`experiments/eval_detection_2x2.py`, 노트북 Cell 25)
+
+| 모델 | 학습 해상도 | 추론 해상도 | All `mAP@50` | All `mAP@50:95` | `Ball AP@50` | `Player AP@50` | Model Inf (ms) | Model FPS* | Peak VRAM |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| YOLOv5m | 640 | 640 | 0.552 | 0.390 | 0.110 | 0.857 | 12.7 | 78.4 | 0.80 GB |
+| YOLOv5m | 640 | 1280 | 0.419 | 0.269 | 0.192 | 0.778 | 45.5 | 22.0 | 2.42 GB |
+| YOLO26m | 1280 | 640 | 0.657 | 0.456 | 0.263 | **0.892** | 15.7 | 63.8 | 1.06 GB |
+| **YOLO26m (채택)** | **1280** | **1280** | **0.662** | **0.485** | **0.397 (3.6×)** | 0.881 | 66.2 | 15.1 | 3.39 GB |
+
+*\*`Model FPS`는 `model.val()` 기준 GPU 순수 forward 시간의 역수이며, End-to-End 파이프라인 FPS와는 구분됩니다.*
+
+### ② 공 궤적 이상치 제거 및 결측 복원 비교 (`experiments/eval_ball_restoration.py`)
+
+소형·고속 객체인 공은 IoU 기반 ByteTrack에서 트랙이 쉽게 끊기므로, 공 전용 후처리로 **양방향 선형 보간(오프라인)**과 **단방향 등속도 Kalman Filter(온라인)**를 모두 구현(`trackers/tracker.py`)하고 8프레임 인공 가림(Masked Occlusion) 평가를 구성했습니다.
+
+- **핵심 구분**: 선형 보간은 결측 전·후의 미래 프레임까지 참조하는 **오프라인(Non-causal)** 방식이고, 표준 Kalman Filter는 과거 상태만으로 외삽하는 **온라인(Causal)** 방식입니다.
+- `clip_0127_0131.mp4` 기준 사전 측정 참고치: Raw 결측 `14.6%` / 급점프 `26회` → 이상치 필터 + 선형 보간 적용 시 8-frame 가림 `MAE 15.91px` (`RMSE 33.60px`) vs 등속도 Kalman `MAE 54.41px` (`RMSE 67.83px`). *(동일 환경 재현은 `python experiments/eval_ball_restoration.py --stub <path>`로 실행 가능)*
+
+### ③ 팀 점유율 정확도 검증 및 분모 불일치 진단 (KOR vs CZE 0~35s, 1,438 유효 프레임)
+
+`0~35초` 구간(59.94 FPS, 2,097프레임 중 볼아웃·슛·전환 제외 유효 GT 1,438프레임)을 대상으로 모델 업그레이드와 `0.5s` 최빈값 스무딩의 효과를 검증했습니다. (`experiments/eval_possession.py`, 노트북 Cell 27·33)
+
+| 실험 조건 | 전체 구간 Acc. (1,438f) | 실제 판정 구간 Acc. | 미배정률 | 정답/유효 (판정수) |
 | :--- | :---: | :---: | :---: | :---: |
-| Raw Detection (`YOLO26m`) | 14.6% | 26 | — | — |
-| **Outlier Filter + Linear Interp (채택)** | **0.0%** | **0** | **15.91 px** | **33.60 px** |
-| Outlier Filter + Kalman Filter (등속도) | 0.0% | 2 | 54.41 px | 67.83 px |
+| 1. Baseline (`YOLOv5m 640`) | **53.3%** | 53.3% | 0.0% | 766 / 1438 (1438) |
+| 2. 모델 개선 (`YOLO26m 1280`) | 37.6% | 60.1% | 37.5% | 540 / 1438 (899) |
+| 3. 모델 개선 + `0.5s` 최빈값 스무딩 | 39.2% | **62.7%** | 37.5% | 564 / 1438 (899) |
 
-* 패스·슛 전환과 카메라 패닝이 잦은 축구 중계에서는 단방향 등속도 `Kalman Filter`보다 전·후 프레임을 모두 참조하는 **양방향 선형 보간(`MAE 15.91px`)이 3.4배 더 정확**함을 확인.
+- **오류 원인 규명**: 초반 `0~9초`(539프레임, 100% 체코 점유)에서 공이 미탐지되면서 `bfill()`이 9초 시점 좌표를 초반 전체에 고정 복사했고, 공-선수 최소 거리 중앙값이 `234.2px`로 벌어져 539프레임 전체가 미배정(`37.5%`)되었습니다.
+- **평가 원칙 수립**: 미배정 구간을 분모에서 제외하고 전체 구간 GT(`58.3%`)와 비교하면 오차가 `0.2%p`처럼 보이는 **분모 불일치 착시**가 발생하므로, `experiments/eval_possession.py`에서는 반드시 **동일 분모 비교 + 미배정률 병기**를 강제합니다.
 
----
+### ④ 원근 왜곡 실증 및 2D 전술 피치 투영 (`tactical_view/homography.py`, 노트북 Cell 28–31)
 
-### ③ 팀 점유율 정확도 분리 검증 (예측 성능 개선 vs 집계 분모 보정)
-한국 vs 체코 하이라이트 `0~35초`(총 2,097프레임 중 볼아웃·슛·전환 제외 **유효 1,438프레임**, 실제 한국 점유율 `58.3%`)에 대해 구간별 Ground Truth를 구축하고, **실제 예측 개선 효과**와 **집계(분모) 변경 효과**를 분리 검증했습니다.
-
-| 실험 조건 | 전체 Acc. (1,438f) | 판정 Acc. (899f) | 미배정률 | 예측 KOR | 점유율 오차 | 핵심 구분 |
-| :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| 1. Baseline (`YOLOv5m 640` · 기존) | 53.3% | 53.3% | 0.0% | 34.8% | 23.5%p | 기준 |
-| 2. 모델 개선 (`YOLO26m 1280` · 기존) | 37.6% | 60.1% | 37.5% | 37.0% | 21.3%p | 실제 예측 개선 (+6.8%p) |
-| 3. `[집계 변경]` 미배정 분모 제외만 적용 | 37.6% | 60.1% | 37.5% | 59.2% | 0.8%p | 집계 분모 보정 효과 |
-| 4. `[예측 변경]` 0.5s 최빈값 스무딩만 적용 | 39.2% | **62.7%** | 37.5% | 36.6% | 21.8%p | 실제 예측 개선 (+2.6%p) |
-| **5. 미배정 분모 제외 + 0.5s 스무딩 (최종)** | **39.2%** | **62.7%** | **37.5%** | **58.5%** | **0.2%p** | **예측 개선 + 집계 보정** |
-| 6. Carry-forward 제거 + 미배정 제외 + 스무딩 | 30.9% | 56.3% | 45.2% | 51.5% | 6.8%p | 보수적 미배정 처리 |
-
-* **실제 예측 성능 개선**: 모델 업그레이드(`+6.8%p`)와 `0.5s` 최빈값 스무딩(`+2.6%p`)으로 판정 구간 정확도가 **`53.3% → 62.7%`(+9.4%p)** 상승.
-* **집계 방식 보정 분리**: 초반 `0~9초`(539프레임, `37.5%`)의 공 미탐지 구간이 분모에 섞여 있던 문제를 분리하자 점유율 오차가 `21.3%p → 0.8%p`, 스무딩 결합 시 **`0.2%p`**(`예측 58.5% vs 실제 58.3%`)로 감소.
-* **분모 차이 명시**: `전체 Acc.(37.6%)`와 `판정 Acc.(60.1%)`의 차이는 동일한 정답 수(`540f`)에 대해 미배정 `539f` 포함 여부(`1,438f` vs `899f`)에서 발생.
+- `08fd33_4.mp4`(750프레임)에서 정적 6점 FIFA 경기장 Homography 기준 `70px` vs `2.5m` 점유 판정을 비교한 결과 **일치율 `81.5%`(611/750)** — `18.5%`(139프레임)에서 카메라 원근 왜곡으로 인한 판정 차이가 발생함을 확인했습니다.
+- Roboflow 32-키포인트 모델(`football-field-detection-f07vi/14`)을 연동한 `ViewTransformer` 프로토타입을 구현했으며, 멀티컷 월드컵 하이라이트에서의 도메인 갭(기본 `conf=0.5` 검출 실패)을 확인해 향후 키포인트 Fine-tuning 과제로 정리했습니다.
 
 ---
 
-### ④ 동적 Homography 및 2D 전술 피치 투영 (`08fd33_4.mp4`, 750프레임)
-* 32개 경기장 라인 교차점 키포인트 모델(`football-field-detection-f07vi/14`)과 `cv2.findHomography(..., cv2.RANSAC)`를 결합해 매 프레임 **13개 고신뢰도 키포인트 자동 검출 → 2D 전술 레이더 투영**을 구현.
-* 동일 클립(750프레임)에서 기존 픽셀 기준(`70px`)과 실제 물리 거리(`2.5m`)의 점유 판정을 비교한 결과 일치율 **`81.5%`(611/750)** — **18.5%(139프레임)에서 원근 왜곡에 따른 판정 차이**를 실증.
+## 4. Quick Start
 
----
+```bash
+pip install -r requirements.txt
 
-## 3. Troubleshooting
+# Roboflow 키포인트 모듈 사용 시 환경변수 설정 (코드 하드코딩 금지)
+export ROBOFLOW_API_KEY="YOUR_ROBOFLOW_API_KEY"
 
-1. **초기 프레임 ByteTrack 활성화 부족으로 인한 K-Means 예외 (`ValueError: n_samples=1 < n_clusters=2`)**
-   * `0번 프레임` 고정 초기화 대신 전체 프레임 중 **최다 선수 탐지 프레임**으로 팀 대표 색상을 학습하도록 수정해 예외 해소.
-2. **선수 유니폼과 잔디 배경 오분류**
-   * 상반신 크롭의 네 꼭짓점 대신 **전체 테두리 픽셀의 최빈 클러스터**를 배경으로 판별하도록 개선.
-3. **공 추적 좌표 급점프 및 예외 처리**
-   * 프레임별 최고 신뢰도 공 1개(`conf ≥ 0.2`) 선택, 이동 거리 이상치 필터(`80px/frame`, 최대 `300px`), 선형 보간, 점유율 분모 `0` 방어 로직 및 영상별 `stubs/*.pkl` 캐시 분리 적용.
-
----
-
-## 4. Limitations & Next Steps
-
-* **초반 공 미탐지 구간의 전체 정확도 제약**: `KOR vs CZE` 초반 `0~9초`처럼 공이 작거나 가려진 구간의 미배정률(`37.5%`)을 줄이기 위해 고해상도 타일링(SAHI) 또는 멀티프레임 공 탐지기 검토 필요.
-* **멀티컷 중계 영상 키포인트 도메인 갭**: 분데스리가 기반 사전학습 키포인트 모델이 월드컵 멀티컷 하이라이트에서는 탐지 실패를 보였으며, 다양한 중계 앵글 데이터를 추가한 **필드 키포인트 모델 Fine-tuning**이 필요.
-
----
-
-## 5. Tech Stack
-
-`Python` · `PyTorch` · `Ultralytics YOLO26m` · `ByteTrack (supervision)` · `OpenCV` · `scikit-learn (K-Means)` · `Roboflow`
+# 메인 파이프라인 실행
+python main.py   --input input_videos/clip_0127_0131.mp4   --output output_videos/clip_0127_0131_output.avi   --model models/best.pt   --imgsz 1280   --ball-method linear   --smooth-sec 0.5
+```
